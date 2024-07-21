@@ -100,6 +100,7 @@ def rms_norm(x, scale, eps):
     dtype = reduce(torch.promote_types, (x.dtype, scale.dtype, torch.float32))
     mean_sq = torch.mean(x.to(dtype)**2, dim=-1, keepdim=True)
     scale = scale.to(dtype) * torch.rsqrt(mean_sq + eps)
+    
     return x * scale.to(x.dtype)
 
 
@@ -662,8 +663,12 @@ class ImageTransformerDenoiserModelV2(nn.Module):
 
         self.patch_in = TokenMerge(in_channels, levels[0].width, patch_size)
 
-        self.time_emb = layers.FourierFeatures(1, mapping.width)
-        self.time_in_proj = Linear(mapping.width, mapping.width, bias=False)
+        self.time_pos_emb = SinusoidalPosEmb(mapping.width)
+        self.time_mlp = nn.Sequential(
+            nn.Linear(mapping.width, mapping.width * 4),
+            nn.GELU(),
+            nn.Linear(mapping.width * 4, mapping.width)
+        )
         self.aug_emb = layers.FourierFeatures(9, mapping.width)
         self.aug_in_proj = Linear(mapping.width, mapping.width, bias=False)
         self.class_emb = nn.Embedding(num_classes, mapping.width) if num_classes else None
@@ -710,11 +715,20 @@ class ImageTransformerDenoiserModelV2(nn.Module):
         return groups
 
     def forward(self, x, sigma, aug_cond=None, class_cond=None, mapping_cond=None):
+        def print_stats(tensor, name):
+            return
+            # print(f"{name} - Mean: {tensor.mean().item():.4f}, Variance: {tensor.var().item():.4f}")
+
+        print_stats(x, "Input 'x'")
+        print_stats(sigma, "Input 'sigma'")
+
         # Patching
         x = x.movedim(-3, -1)
         x = self.patch_in(x)
-        # TODO: pixel aspect ratio for nonsquare patches
+        print_stats(x, "After patch_in")
+
         pos = make_axial_pos(x.shape[-3], x.shape[-2], device=x.device).view(x.shape[-3], x.shape[-2], 2)
+        print_stats(pos, "Position encoding")
 
         # Mapping network
         if class_cond is None and self.class_emb is not None:
@@ -722,32 +736,63 @@ class ImageTransformerDenoiserModelV2(nn.Module):
         if mapping_cond is None and self.mapping_cond_in_proj is not None:
             raise ValueError("mapping_cond must be specified if mapping_cond_dim > 0")
 
-        c_noise = torch.log(sigma) / 4
-        time_emb = self.time_in_proj(self.time_emb(c_noise[..., None]))
+        # Time embedding
+        time_emb = self.time_pos_emb(sigma)
+        print_stats(time_emb, "After time_pos_emb")
+        time_emb = self.time_mlp(time_emb)
+        print_stats(time_emb, "After time_mlp")
+
         aug_cond = x.new_zeros([x.shape[0], 9]) if aug_cond is None else aug_cond
         aug_emb = self.aug_in_proj(self.aug_emb(aug_cond))
+        print_stats(aug_emb, "Aug embedding")
+
         class_emb = self.class_emb(class_cond) if self.class_emb is not None else 0
         mapping_emb = self.mapping_cond_in_proj(mapping_cond) if self.mapping_cond_in_proj is not None else 0
+        
         cond = self.mapping(time_emb + aug_emb + class_emb + mapping_emb)
+        print_stats(cond, "After mapping")
 
         # Hourglass transformer
         skips, poses = [], []
-        for down_level, merge in zip(self.down_levels, self.merges):
+        for i, (down_level, merge) in enumerate(zip(self.down_levels, self.merges)):
             x = down_level(x, pos, cond)
+            print_stats(x, f"After down_level {i}")
             skips.append(x)
             poses.append(pos)
             x = merge(x)
+            print_stats(x, f"After merge {i}")
             pos = downscale_pos(pos)
 
         x = self.mid_level(x, pos, cond)
+        print_stats(x, "After mid_level")
 
-        for up_level, split, skip, pos in reversed(list(zip(self.up_levels, self.splits, skips, poses))):
+        for i, (up_level, split, skip, pos) in enumerate(reversed(list(zip(self.up_levels, self.splits, skips, poses)))):
             x = split(x, skip)
+            print_stats(x, f"After split {i}")
             x = up_level(x, pos, cond)
+            print_stats(x, f"After up_level {i}")
 
         # Unpatching
         x = self.out_norm(x)
+        print_stats(x, "After out_norm")
         x = self.patch_out(x)
+        print_stats(x, "After patch_out")
         x = x.movedim(-1, -3)
 
+        print_stats(x, "Final output")
+
         return x
+
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super(SinusoidalPosEmb, self).__init__()
+        self.dim = dim
+
+    def forward(self, x, scale=1000):
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device).float() * -emb)
+        emb = scale * x.unsqueeze(1) * emb.unsqueeze(0)
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
