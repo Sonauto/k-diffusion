@@ -14,12 +14,15 @@ from torch.nn import functional as F
 from . import flags, flops
 from .. import layers
 from .axial_rope import make_axial_pos
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+import functools
 
-
-try:
-    import natten
-except ImportError:
-    natten = None
+# try:
+import natten
+natten.use_kv_parallelism_in_fused_na(True)
+natten.set_memory_usage_preference("unrestricted")
+# except ImportError:
+#     natten = None
 
 try:
     import flash_attn
@@ -387,22 +390,64 @@ class SelfAttentionBlock(nn.Module):
         x = self.out_proj(x)
         return x + skip
 
-
-class NeighborhoodSelfAttentionBlock(nn.Module):
-    def __init__(self, d_model, d_head, cond_features, kernel_size, dropout=0.0):
+class VerticalSelfAttentionBlock(nn.Module):
+    def __init__(self, d_model, d_head, cond_features, dropout=0.0):
         super().__init__()
+        self.d_model = d_model
         self.d_head = d_head
         self.n_heads = d_model // d_head
-        self.kernel_size = kernel_size
         self.norm = AdaRMSNorm(d_model, cond_features)
         self.qkv_proj = apply_wd(Linear(d_model, d_model * 3, bias=False))
         self.scale = nn.Parameter(torch.full([self.n_heads], 10.0))
-        self.pos_emb = AxialRoPE(d_head // 2, self.n_heads)
         self.dropout = nn.Dropout(dropout)
         self.out_proj = apply_wd(zero_init(Linear(d_model, d_model, bias=False)))
 
     def extra_repr(self):
-        return f"d_head={self.d_head}, kernel_size={self.kernel_size}"
+        return f"d_head={self.d_head},"
+
+    def forward(self, x, cond):
+        skip = x
+        x = self.norm(x, cond)
+        qkv = self.qkv_proj(x)
+
+        n, h, w, c = qkv.shape
+        qkv = rearrange(qkv, "n h w (t nh e) -> (n w) h t nh e", t=3, nh=self.n_heads, e=self.d_head)
+
+        if use_flash_2(qkv):
+            qkv = scale_for_cosine_sim_qkv(qkv, self.scale, 1e-6)
+            flops_shape = qkv.shape[-4], qkv.shape[-2], qkv.shape[-3], qkv.shape[-1]
+            flops.op(flops.op_attention, flops_shape, flops_shape, flops_shape)
+            x = flash_attn.flash_attn_qkvpacked_func(qkv, softmax_scale=1.0)
+        else:
+            q, k, v = rearrange(qkv, "(n w) h t nh e -> t (n w) nh h e", n=n, w=w)
+            q, k = scale_for_cosine_sim(q, k, self.scale[:, None, None], 1e-6)
+            flops.op(flops.op_attention, q.shape, k.shape, v.shape)
+            x = F.scaled_dot_product_attention(q, k, v, scale=1.0)
+            x = rearrange(x, "(n w) nh h e -> (n w) h nh e", n=n, w=w)
+
+        x = rearrange(x, "(n w) h nh e -> n h w (nh e)", n=n, w=w)
+        
+        x = self.dropout(x)
+        x = self.out_proj(x)
+        return x + skip
+     
+class NeighborhoodSelfAttentionBlock(nn.Module):
+    def __init__(self, d_model, d_head, cond_features, kernel_size, dropout=0.0, use_learned_pos_emb=False):
+        super().__init__()
+        self.d_head = d_head
+        self.n_heads = d_model // d_head
+        self.kernel_size = kernel_size
+        self.use_learned_pos_emb = use_learned_pos_emb
+        self.norm = AdaRMSNorm(d_model, cond_features)
+        self.qkv_proj = apply_wd(Linear(d_model, d_model * 3, bias=False))
+        self.scale = nn.Parameter(torch.full([self.n_heads], 10.0))
+        if not use_learned_pos_emb:
+            self.pos_emb = AxialRoPE(d_head // 2, self.n_heads)
+        self.dropout = nn.Dropout(dropout)
+        self.out_proj = apply_wd(zero_init(Linear(d_model, d_model, bias=False)))
+
+    def extra_repr(self):
+        return f"d_head={self.d_head}, kernel_size={self.kernel_size}, use_learned_pos_emb={self.use_learned_pos_emb}"
 
     def forward(self, x, pos, cond):
         skip = x
@@ -413,18 +458,20 @@ class NeighborhoodSelfAttentionBlock(nn.Module):
         if natten.has_fused_na():
             q, k, v = rearrange(qkv, "n h w (t nh e) -> t n h w nh e", t=3, e=self.d_head)
             q, k = scale_for_cosine_sim(q, k, self.scale[:, None], 1e-6)
-            theta = self.pos_emb(pos)
-            q = apply_rotary_emb_(q, theta)
-            k = apply_rotary_emb_(k, theta)
+            if not self.use_learned_pos_emb and pos is not None:
+                theta = self.pos_emb(pos)
+                q = apply_rotary_emb_(q, theta)
+                k = apply_rotary_emb_(k, theta)
             flops.op(flops.op_natten, q.shape, k.shape, v.shape, self.kernel_size)
             x = natten.functional.na2d(q, k, v, self.kernel_size, scale=1.0)
             x = rearrange(x, "n h w nh e -> n h w (nh e)")
         else:
             q, k, v = rearrange(qkv, "n h w (t nh e) -> t n nh h w e", t=3, e=self.d_head)
             q, k = scale_for_cosine_sim(q, k, self.scale[:, None, None, None], 1e-6)
-            theta = self.pos_emb(pos).movedim(-2, -4)
-            q = apply_rotary_emb_(q, theta)
-            k = apply_rotary_emb_(k, theta)
+            if not self.use_learned_pos_emb and pos is not None:
+                theta = self.pos_emb(pos).movedim(-2, -4)
+                q = apply_rotary_emb_(q, theta)
+                k = apply_rotary_emb_(k, theta)
             flops.op(flops.op_natten, q.shape, k.shape, v.shape, self.kernel_size)
             qk = natten.functional.na2d_qk(q, k, self.kernel_size)
             a = torch.softmax(qk, dim=-1).to(v.dtype)
@@ -433,7 +480,6 @@ class NeighborhoodSelfAttentionBlock(nn.Module):
         x = self.dropout(x)
         x = self.out_proj(x)
         return x + skip
-
 
 class ShiftedWindowSelfAttentionBlock(nn.Module):
     def __init__(self, d_model, d_head, cond_features, window_size, window_shift, dropout=0.0):
@@ -498,14 +544,23 @@ class GlobalTransformerLayer(nn.Module):
 
 
 class NeighborhoodTransformerLayer(nn.Module):
-    def __init__(self, d_model, d_ff, d_head, cond_features, kernel_size, dropout=0.0):
+    def __init__(self, d_model, d_ff, d_head, cond_features, kernel_size, dropout=0.0, use_learned_pos_emb=False, is_first=False, is_last=False):
         super().__init__()
-        self.self_attn = NeighborhoodSelfAttentionBlock(d_model, d_head, cond_features, kernel_size, dropout=dropout)
+        self.is_first = is_first
+        self.is_last = is_last
+        if self.is_first or self.is_last:
+            # def __init__(self, d_model, d_head, cond_features, dropout=0.0):
+            self.vertical_attention = VerticalSelfAttentionBlock(d_model, d_head, cond_features, dropout=dropout)
+        self.self_attn = NeighborhoodSelfAttentionBlock(d_model, d_head, cond_features, kernel_size, dropout=dropout, use_learned_pos_emb=use_learned_pos_emb)
         self.ff = FeedForwardBlock(d_model, d_ff, cond_features, dropout=dropout)
 
     def forward(self, x, pos, cond):
+        if self.is_last:
+            x = checkpoint(self.vertical_attention, x, cond)
         x = checkpoint(self.self_attn, x, pos, cond)
         x = checkpoint(self.ff, x, cond)
+        if self.is_first: #or self.is_last: # temporarily putting is_last at the end due to needing to deal with skip connection
+            x = checkpoint(self.vertical_attention, x, cond)
         return x
 
 
@@ -576,40 +631,65 @@ class MappingNetwork(nn.Module):
 # Token merging and splitting
 
 class TokenMerge(nn.Module):
-    def __init__(self, in_features, out_features, patch_size=(2, 2)):
+    def __init__(self, in_features, out_features, patch_size=(2, 2), new_vertical_merge=False):
         super().__init__()
         self.h = patch_size[0]
         self.w = patch_size[1]
+        self.new_vertical_merge = new_vertical_merge
         self.proj = apply_wd(Linear(in_features * self.h * self.w, out_features, bias=False))
 
     def forward(self, x):
-        x = rearrange(x, "... (h nh) (w nw) e -> ... h w (nh nw e)", nh=self.h, nw=self.w)
+        if self.new_vertical_merge:
+            B, H, W, C = x.shape
+            section_height = H // self.h
+            x_sections = [x[:, i*section_height:(i+1)*section_height, :, :] for i in range(self.h)]
+            x = torch.cat(x_sections, dim=-1)
+            x = x.reshape(B, section_height, W // self.w, self.w * self.h * C)
+        else:
+            x = rearrange(x, "... (h nh) (w nw) e -> ... h w (nh nw e)", nh=self.h, nw=self.w)
         return self.proj(x)
 
-
 class TokenSplitWithoutSkip(nn.Module):
-    def __init__(self, in_features, out_features, patch_size=(2, 2)):
+    def __init__(self, in_features, out_features, patch_size=(2, 2), new_vertical_merge=False):
         super().__init__()
         self.h = patch_size[0]
         self.w = patch_size[1]
+        self.new_vertical_merge = new_vertical_merge
         self.proj = apply_wd(Linear(in_features, out_features * self.h * self.w, bias=False))
 
     def forward(self, x):
         x = self.proj(x)
-        return rearrange(x, "... h w (nh nw e) -> ... (h nh) (w nw) e", nh=self.h, nw=self.w)
-
+        if self.new_vertical_merge:
+            B, H, W, C = x.shape
+            x = x.reshape(B, H, W, self.h, -1)
+            x_sections = torch.split(x, x.size(4) // self.h, dim=-1)
+            x = torch.cat([section.unsqueeze(1) for section in x_sections], dim=1)
+            x = x.reshape(B, H * self.h, W, -1)
+            x = x.reshape(B, H * self.h, W * self.w, -1)
+        else:
+            x = rearrange(x, "... h w (nh nw e) -> ... (h nh) (w nw) e", nh=self.h, nw=self.w)
+        return x
 
 class TokenSplit(nn.Module):
-    def __init__(self, in_features, out_features, patch_size=(2, 2)):
+    def __init__(self, in_features, out_features, patch_size=(2, 2), new_vertical_merge=False):
         super().__init__()
         self.h = patch_size[0]
         self.w = patch_size[1]
+        self.new_vertical_merge = new_vertical_merge
         self.proj = apply_wd(Linear(in_features, out_features * self.h * self.w, bias=False))
         self.fac = nn.Parameter(torch.ones(1) * 0.5)
 
     def forward(self, x, skip):
         x = self.proj(x)
-        x = rearrange(x, "... h w (nh nw e) -> ... (h nh) (w nw) e", nh=self.h, nw=self.w)
+        if self.new_vertical_merge:
+            B, H, W, C = x.shape
+            x = x.reshape(B, H, W, self.h, -1)
+            x_sections = torch.split(x, x.size(4) // self.h, dim=-1)
+            x = torch.cat([section.unsqueeze(1) for section in x_sections], dim=1)
+            x = x.reshape(B, H * self.h, W, -1)
+            x = x.reshape(B, H * self.h, W * self.w, -1)
+        else:
+            x = rearrange(x, "... h w (nh nw e) -> ... (h nh) (w nw) e", nh=self.h, nw=self.w)
         return torch.lerp(skip, x, self.fac.to(x.dtype))
 
 
@@ -657,9 +737,10 @@ class MappingSpec:
 # Model class
 
 class ImageTransformerDenoiserModelV2(nn.Module):
-    def __init__(self, levels, mapping, in_channels, out_channels, patch_size, num_classes=0, mapping_cond_dim=0):
+    def __init__(self, levels, mapping, in_channels, out_channels, patch_size, num_classes=0, mapping_cond_dim=0, use_learned_pos_emb=False, learned_pos_emb_width=None, sinusoidal_posemb=False, in_height=None, new_vertical_merge=False, vertical_attention=False):
         super().__init__()
         self.num_classes = num_classes
+        self.use_learned_pos_emb = use_learned_pos_emb
 
         self.patch_in = TokenMerge(in_channels, levels[0].width, patch_size)
 
@@ -675,60 +756,64 @@ class ImageTransformerDenoiserModelV2(nn.Module):
         self.mapping_cond_in_proj = Linear(mapping_cond_dim, mapping.width, bias=False) if mapping_cond_dim else None
         self.mapping = tag_module(MappingNetwork(mapping.depth, mapping.width, mapping.d_ff, dropout=mapping.dropout), "mapping")
 
+        if use_learned_pos_emb:
+            if learned_pos_emb_width is None:
+                raise ValueError("learned_pos_emb_width must be specified when use_learned_pos_emb is True")
+            if sinusoidal_posemb:
+                self.pos_emb = positionalencoding2d(levels[0].width, in_height // patch_size[0], learned_pos_emb_width)
+                self.pos_emb = rearrange(self.pos_emb, "c h w -> h w c")
+                self.pos_emb.requires_grad = False
+            else:
+                self.pos_emb = nn.Parameter(torch.randn(in_height // patch_size[0], learned_pos_emb_width, levels[0].width))
+            
+
         self.down_levels, self.up_levels = nn.ModuleList(), nn.ModuleList()
         for i, spec in enumerate(levels):
-            if isinstance(spec.self_attn, GlobalAttentionSpec):
-                layer_factory = lambda _: GlobalTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, dropout=spec.dropout)
-            elif isinstance(spec.self_attn, NeighborhoodAttentionSpec):
-                layer_factory = lambda _: NeighborhoodTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.kernel_size, dropout=spec.dropout)
-            elif isinstance(spec.self_attn, ShiftedWindowAttentionSpec):
-                layer_factory = lambda i: ShiftedWindowTransformerLayer(spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, spec.self_attn.window_size, i, dropout=spec.dropout)
-            elif isinstance(spec.self_attn, NoAttentionSpec):
-                layer_factory = lambda _: NoAttentionTransformerLayer(spec.width, spec.d_ff, mapping.width, dropout=spec.dropout)
-            else:
-                raise ValueError(f"unsupported self attention spec {spec.self_attn}")
+            layer_factory = lambda d, is_first=False, is_last=False: NeighborhoodTransformerLayer(
+                spec.width, spec.d_ff, spec.self_attn.d_head, mapping.width, 
+                spec.self_attn.kernel_size, dropout=spec.dropout, 
+                use_learned_pos_emb=use_learned_pos_emb, 
+                is_first=(vertical_attention and is_first), is_last=(vertical_attention and is_last)
+            )
 
             if i < len(levels) - 1:
-                self.down_levels.append(Level([layer_factory(i) for i in range(spec.depth)]))
-                self.up_levels.append(Level([layer_factory(i + spec.depth) for i in range(spec.depth)]))
-            else:
-                self.mid_level = Level([layer_factory(i) for i in range(spec.depth)])
+                # For down_levels
+                down_layers = [
+                    layer_factory(d, is_first=(d == spec.depth - 1))
+                    for d in range(spec.depth)
+                ]
+                self.down_levels.append(Level(down_layers))
 
-        self.merges = nn.ModuleList([TokenMerge(spec_1.width, spec_2.width) for spec_1, spec_2 in zip(levels[:-1], levels[1:])])
-        self.splits = nn.ModuleList([TokenSplit(spec_2.width, spec_1.width) for spec_1, spec_2 in zip(levels[:-1], levels[1:])])
+                # For up_levels
+                up_layers = [
+                    layer_factory(d + spec.depth, is_last=(d == 0))
+                    for d in range(spec.depth)
+                ]
+                self.up_levels.append(Level(up_layers))
+            else:
+                self.mid_level = Level([layer_factory(d) for d in range(spec.depth)])
+
+        self.merges = nn.ModuleList([TokenMerge(spec_1.width, spec_2.width, new_vertical_merge=new_vertical_merge) for spec_1, spec_2 in zip(levels[:-1], levels[1:])])
+        self.splits = nn.ModuleList([TokenSplit(spec_2.width, spec_1.width, new_vertical_merge=new_vertical_merge) for spec_1, spec_2 in zip(levels[:-1], levels[1:])])
 
         self.out_norm = RMSNorm(levels[0].width)
         self.patch_out = TokenSplitWithoutSkip(levels[0].width, out_channels, patch_size)
         nn.init.zeros_(self.patch_out.proj.weight)
 
-    def param_groups(self, base_lr=5e-4, mapping_lr_scale=1 / 3):
-        wd = filter_params(lambda tags: "wd" in tags and "mapping" not in tags, self)
-        no_wd = filter_params(lambda tags: "wd" not in tags and "mapping" not in tags, self)
-        mapping_wd = filter_params(lambda tags: "wd" in tags and "mapping" in tags, self)
-        mapping_no_wd = filter_params(lambda tags: "wd" not in tags and "mapping" in tags, self)
-        groups = [
-            {"params": list(wd), "lr": base_lr},
-            {"params": list(no_wd), "lr": base_lr, "weight_decay": 0.0},
-            {"params": list(mapping_wd), "lr": base_lr * mapping_lr_scale},
-            {"params": list(mapping_no_wd), "lr": base_lr * mapping_lr_scale, "weight_decay": 0.0}
-        ]
-        return groups
-
     def forward(self, x, sigma, aug_cond=None, class_cond=None, mapping_cond=None):
-        def print_stats(tensor, name):
-            return
-            # print(f"{name} - Mean: {tensor.mean().item():.4f}, Variance: {tensor.var().item():.4f}")
-
-        print_stats(x, "Input 'x'")
-        print_stats(sigma, "Input 'sigma'")
-
         # Patching
         x = x.movedim(-3, -1)
         x = self.patch_in(x)
         print_stats(x, "After patch_in")
 
-        pos = make_axial_pos(x.shape[-3], x.shape[-2], device=x.device).view(x.shape[-3], x.shape[-2], 2)
-        print_stats(pos, "Position encoding")
+        if self.use_learned_pos_emb:
+            learned_pos = self.pos_emb.repeat(1, (x.shape[-2] - 1) // self.pos_emb.shape[-2] + 1, 1)
+            learned_pos = learned_pos[:, :x.shape[-2], :].to(x)
+            x = x + learned_pos
+            pos = None
+        else:
+            pos = make_axial_pos(x.shape[-3], x.shape[-2], device=x.device).view(x.shape[-3], x.shape[-2], 2)
+            print_stats(pos, "Position encoding")
 
         # Mapping network
         if class_cond is None and self.class_emb is not None:
@@ -761,7 +846,8 @@ class ImageTransformerDenoiserModelV2(nn.Module):
             poses.append(pos)
             x = merge(x)
             print_stats(x, f"After merge {i}")
-            pos = downscale_pos(pos)
+            if pos is not None:
+                pos = downscale_pos(pos)
 
         x = self.mid_level(x, pos, cond)
         print_stats(x, "After mid_level")
@@ -783,6 +869,10 @@ class ImageTransformerDenoiserModelV2(nn.Module):
 
         return x
 
+def print_stats(tensor, name):
+    return
+    # print(f"{name} - shape: {tensor.shape} Mean: {tensor.mean().item():.4f}, Variance: {tensor.var().item():.4f}")
+
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
         super(SinusoidalPosEmb, self).__init__()
@@ -796,3 +886,28 @@ class SinusoidalPosEmb(nn.Module):
         emb = scale * x.unsqueeze(1) * emb.unsqueeze(0)
         emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
         return emb
+
+
+def positionalencoding2d(d_model, height, width):
+    """
+    :param d_model: dimension of the model
+    :param height: height of the positions
+    :param width: width of the positions
+    :return: d_model*height*width position matrix
+    """
+    if d_model % 4 != 0:
+        raise ValueError("Cannot use sin/cos positional encoding with "
+                         "odd dimension (got dim={:d})".format(d_model))
+    pe = torch.zeros(d_model, height, width)
+    # Each dimension use half of d_model
+    d_model = int(d_model / 2)
+    div_term = torch.exp(torch.arange(0., d_model, 2) *
+                         -(math.log(10000.0) / d_model))
+    pos_w = torch.arange(0., width).unsqueeze(1)
+    pos_h = torch.arange(0., height).unsqueeze(1)
+    pe[0:d_model:2, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
+    pe[1:d_model:2, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, height, 1)
+    pe[d_model::2, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
+    pe[d_model + 1::2, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, width)
+
+    return pe
